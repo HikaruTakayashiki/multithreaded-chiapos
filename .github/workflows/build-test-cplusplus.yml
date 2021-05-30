@@ -21,12 +21,6 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v2
 
-    - name: Install boost
-      uses: MarkusJx/install-boost@v1.0.1
-      id: install-boost
-      with:
-        boost_version: 1.71.0
-
     - name: cmake, RunTests with Windows
       if: startsWith(matrix.os, 'windows')
       run: |
@@ -35,8 +29,6 @@ jobs:
         cmake ..
         cmake --build . --config Release -j 6
         ctest -C Release -j 6
-      env:
-        BOOST_ROOT: ${{ steps.install-boost.outputs.BOOST_ROOT }}
 
     - name: cmake, RunTests, and valgrind on ${{ matrix.os }}
       if: startsWith(matrix.os, 'ubuntu')
