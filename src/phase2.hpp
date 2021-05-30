@@ -18,8 +18,7 @@
 #include <algorithm> //std::copy
 #include <thread>
 #include <atomic>
-#include <chrono> // this_thread::sleep_for
-#include <memory> // std::make_shared
+#include <chrono>
 #include <functional> // std::ref
 
 #include "disk.hpp"
@@ -29,8 +28,6 @@
 #include "bitfield_index.hpp"
 #include "progress.hpp"
 #include "thread_pool.hpp"
-
-#include "concurrent_queue.hpp"
 
 struct Phase2Results
 {
@@ -44,16 +41,6 @@ struct Phase2Results
     BufferedDisk table7;
     std::vector<std::unique_ptr<SortManager>> output_files;
     std::vector<uint64_t> table_sizes;
-};
-
-
-class exit_flag
-{
-    std::atomic<bool> exited_{false};
-    public:
-        void exit() { exited_.store(true, std::memory_order_release); }
-        explicit operator bool() const noexcept { return exited_.load(std::memory_order_acquire); }
-        bool operator !() const noexcept { return !static_cast<bool>(*this); }
 };
 
 void* ScanThread(bitfield const& current_bitfield,
@@ -101,100 +88,70 @@ void* ScanThread(bitfield const& current_bitfield,
     return 0;
 }
 
-struct SORTTHREADDATA
-{
-    int64_t const chunk;
-    int64_t const read_index;
-    int64_t const write_counter;
-    std::shared_ptr<uint8_t> entry;
-    SORTTHREADDATA(int64_t chunk_, int64_t read_index_, int64_t write_counter_, std::shared_ptr<uint8_t> entry_)
-    : chunk(chunk_), read_index(read_index_), write_counter(write_counter_), entry(entry_)
-    {}
-};
-
-void* SortThread(bitfield* current_bitfield,
-                 bitfield_index const* index,
+void* SortThread(bitfield const& current_bitfield,
+                 bitfield_index const& index,
                  uint8_t const k,
                  uint8_t const pos_offset_size,
                  uint8_t const pos_offset_shift,
                  int16_t const entry_size,
                  uint8_t const write_counter_shift,
-                 concurrent_queue<std::shared_ptr<SORTTHREADDATA> >* q,
-                 exit_flag *exitflag,
+                 int64_t const chunk,
+                 int64_t const read_index,
+                 int64_t const write_counter,
+                 std::shared_ptr<uint8_t> entry_chunk,
                  SortManager* sort_manager,
-                 std::mutex *smm)
+                 std::mutex& smm)
 {
-    while(true)
-    {
-        if (q->empty()) {
-            if (*exitflag) {
-                break;
-            }else{
-                std::this_thread::sleep_for(std::chrono::milliseconds(20));
-                continue;
-            }
-        }
-        const auto od = q->pop();
-        if(od == boost::none)
-        {
-            continue;
-        }
-        const auto d = od.get();
-        std::shared_ptr<uint8_t> entry_chunk = d->entry;
-        int64_t chunk = d->chunk;
-        int64_t read_index = d->read_index;
-        int64_t write_counter = d->write_counter;
+    auto chunk_ptr = new(std::nothrow) std::unique_ptr<uint8_t[]>[chunk];
+    if (!chunk_ptr){
+        std::cout << "chunkptr nullptr!" << std::endl;
+        exit(1);
+    }
+    std::unique_ptr<std::unique_ptr<uint8_t[]>[]> bytes(chunk_ptr);
 
-        auto chunk_ptr = new(std::nothrow) std::unique_ptr<uint8_t[]>[chunk];
-        if (!chunk_ptr){
-            std::cout << "chunkptr nullptr!" << std::endl;
+    for(int64_t r = 0; r < chunk; ++r){
+        auto bytes_ptr = new(std::nothrow) uint8_t[16];
+        if(!bytes_ptr){
+            std::cout << "bytesptr nullptr!" << std::endl;
             exit(1);
         }
-        std::unique_ptr<std::unique_ptr<uint8_t[]>[]> bytes(chunk_ptr);
+        bytes[r].reset(bytes_ptr);
+    }
 
-        for(int64_t r = 0; r < chunk; ++r){
-            auto bytes_ptr = new(std::nothrow) uint8_t[16];
-            if(!bytes_ptr){
-                std::cout << "bytesptr nullptr!" << std::endl;
-                exit(1);
-            }
-            bytes[r].reset(bytes_ptr);
-        }
+    int64_t writer_counter_of_this_thread = 0;
+    for(int64_t r = 0; r < chunk; ++r){
+        uint8_t const* entry = reinterpret_cast<uint8_t*>(entry_chunk.get()) + r*entry_size;
+        uint64_t entry_pos_offset = Util::SliceInt64FromBytes(entry, 0, pos_offset_size);
 
-        int64_t writer_counter_of_this_thread = 0;
-        for(int64_t r = 0; r < chunk; ++r){
-            uint8_t const* entry = reinterpret_cast<uint8_t*>(entry_chunk.get()) + r*entry_size;
-            uint64_t entry_pos_offset = Util::SliceInt64FromBytes(entry, 0, pos_offset_size);
+        // skipping
+        if (!current_bitfield.get(read_index+r)) continue;
 
-            // skipping
-            if (!current_bitfield->get(read_index+r)) continue;
+        uint64_t entry_pos = entry_pos_offset >> kOffsetSize;
+        uint64_t entry_offset = entry_pos_offset & ((1U << kOffsetSize) - 1);
 
-            uint64_t entry_pos = entry_pos_offset >> kOffsetSize;
-            uint64_t entry_offset = entry_pos_offset & ((1U << kOffsetSize) - 1);
+        // assemble the new entry and write it to the sort manager
 
-            // assemble the new entry and write it to the sort manager
+        // map the pos and offset to the new, compacted, positions and
+        // offsets
+        std::tie(entry_pos, entry_offset) = index.lookup(entry_pos, entry_offset);
+        entry_pos_offset = (entry_pos << kOffsetSize) | entry_offset;
 
-            // map the pos and offset to the new, compacted, positions and
-            // offsets
-            std::tie(entry_pos, entry_offset) = index->lookup(entry_pos, entry_offset);
-            entry_pos_offset = (entry_pos << kOffsetSize) | entry_offset;
+        // The new entry is slightly different. Metadata is dropped, to
+        // save space, and the counter of the entry is written (sort_key). We
+        // use this instead of (y + pos + offset) since its smaller.
+        uint128_t new_entry = static_cast<uint128_t>(write_counter + writer_counter_of_this_thread) << write_counter_shift;
+        new_entry |= (uint128_t)entry_pos_offset << pos_offset_shift;
+        Util::IntTo16Bytes(bytes[writer_counter_of_this_thread].get(), new_entry);
+        writer_counter_of_this_thread++;
+    }
 
-            // The new entry is slightly different. Metadata is dropped, to
-            // save space, and the counter of the entry is written (sort_key). We
-            // use this instead of (y + pos + offset) since its smaller.
-            uint128_t new_entry = static_cast<uint128_t>(write_counter + writer_counter_of_this_thread) << write_counter_shift;
-            new_entry |= (uint128_t)entry_pos_offset << pos_offset_shift;
-            Util::IntTo16Bytes(bytes[writer_counter_of_this_thread].get(), new_entry);
-            writer_counter_of_this_thread++;
-        }
-
-        {
-            std::lock_guard<std::mutex> lock(*smm);
-            for(int64_t r = 0; r < writer_counter_of_this_thread; ++r){
-                sort_manager->AddToCache(bytes[r].get());
-            }
+    {
+        std::lock_guard<std::mutex> lock(smm);
+        for(int64_t r = 0; r < writer_counter_of_this_thread; ++r){
+            sort_manager->AddToCache(bytes[r].get());
         }
     }
+    
     return 0;
 }
 
@@ -297,8 +254,6 @@ Phase2Results RunPhase2(
             std::cout << "parallel scanning" << std::endl;
             std::mutex next_bitfield_mutex;
 
-            std::cout << "thread created" << std::endl;
-
             //TODO: chunk_size should be determined by memory usage
             const int64_t chunk_size = 128*1024*1024/entry_size > entry_size ? 128*1024*1024/entry_size : entry_size;
 
@@ -400,17 +355,7 @@ Phase2Results RunPhase2(
             }
         }else{
             std::cout << "parallel sorting" << std::endl;
-            std::vector<std::thread> threads;
-            concurrent_queue<std::shared_ptr<SORTTHREADDATA> > q;
             std::mutex sort_manager_mutex;
-            exit_flag exitflag;
-
-            for (int i = 0; i < num_threads; ++i) {
-                threads.emplace_back(SortThread, &current_bitfield, &index, k, pos_offset_size,
-                                                 pos_offset_shift, entry_size, write_counter_shift,
-                                                 &q, &exitflag, sort_manager.get(), &sort_manager_mutex);
-            }
-            std::cout << "thread created" << std::endl;
 
             //TODO: chunk_size should be determined by memory usage
             const int64_t chunk_size = 128*1024*1024/entry_size > entry_size ? 128*1024*1024/entry_size : entry_size;
@@ -428,17 +373,29 @@ Phase2Results RunPhase2(
                 std::shared_ptr<uint8_t> sp(sp_ptr, std::default_delete<uint8_t[]>()); // shared_ptr does'nt support array in C++ 17
                 std::copy(entry, entry + chunk*entry_size, sp.get());
 
-                q.push(std::make_shared<SORTTHREADDATA>(chunk,read_index,write_counter,sp));
+                pool.push_task(SortThread, std::ref(current_bitfield),
+                                           std::ref(index),
+                                           k,
+                                           pos_offset_size,
+                                           pos_offset_shift,
+                                           entry_size,
+                                           write_counter_shift,
+                                           chunk,
+                                           read_index,
+                                           write_counter,
+                                           std::move(sp),
+                                           sort_manager.get(),
+                                           std::ref(sort_manager_mutex)
+                );
+
+                // compensates the write_counter as if it will be done.
                 for(int64_t r = 0; r < chunk; ++r){
                     if (current_bitfield.get(read_index+r)) write_counter++;
                 }
             }
 
-            exitflag.exit();
             std::cout << "finished making jobs" << std::endl;
-            for (auto& t : threads) {
-                t.join();
-            }
+            pool.wait_for_tasks();
         }
 
         if (table_index != 7) {
