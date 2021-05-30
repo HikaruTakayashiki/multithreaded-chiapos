@@ -20,6 +20,7 @@
 #include <atomic>
 #include <chrono> // this_thread::sleep_for
 #include <memory> // std::make_shared
+#include <functional> // std::ref
 
 #include "disk.hpp"
 #include "entry_sizes.hpp"
@@ -27,6 +28,8 @@
 #include "bitfield.hpp"
 #include "bitfield_index.hpp"
 #include "progress.hpp"
+#include "thread_pool.hpp"
+
 #include "concurrent_queue.hpp"
 
 struct Phase2Results
@@ -43,15 +46,60 @@ struct Phase2Results
     std::vector<uint64_t> table_sizes;
 };
 
-struct SCANTHREADDATA
+
+class exit_flag
 {
-    int64_t const chunk;
-    int64_t const read_index;
-    std::shared_ptr<uint8_t> entry;
-    SCANTHREADDATA(int64_t chunk_, int64_t read_index_, std::shared_ptr<uint8_t> entry_)
-    : chunk(chunk_), read_index(read_index_), entry(entry_)
-    {}
+    std::atomic<bool> exited_{false};
+    public:
+        void exit() { exited_.store(true, std::memory_order_release); }
+        explicit operator bool() const noexcept { return exited_.load(std::memory_order_acquire); }
+        bool operator !() const noexcept { return !static_cast<bool>(*this); }
 };
+
+void* ScanThread(bitfield const& current_bitfield,
+                 bitfield& next_bitfield,
+                 uint8_t const k,
+                 uint8_t const pos_offset_size,
+                 int16_t const entry_size,
+                 int64_t const chunk,
+                 int64_t const read_index,
+                 std::shared_ptr<uint8_t> entry_chunk,
+                 std::mutex& nbm)
+{
+    std::vector<uint64_t> entry_poses;
+    std::vector<uint64_t> entry_offsets;
+    entry_poses.reserve(chunk);
+    entry_offsets.reserve(chunk);
+
+    int64_t pos_size = 0;
+    for(int64_t r = 0; r < chunk; ++r){
+        uint8_t const* entry = reinterpret_cast<uint8_t*>(entry_chunk.get()) + r*entry_size;
+        uint64_t entry_pos_offset = 0;
+        if (!current_bitfield.get(read_index+r))
+        {
+            // This entry should be dropped.
+            continue;
+        }
+        entry_pos_offset = Util::SliceInt64FromBytes(entry, 0, pos_offset_size);
+
+        uint64_t entry_pos = entry_pos_offset >> kOffsetSize;
+        uint64_t entry_offset = entry_pos_offset & ((1U << kOffsetSize) - 1);
+        entry_poses.emplace_back(entry_pos);
+        entry_offsets.emplace_back(entry_offset);
+
+        pos_size++;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(nbm);
+        for(int64_t r = 0; r < pos_size; ++r){
+        // mark the two matching entries as used (pos and pos+offset)
+            next_bitfield.set(entry_poses[r]);
+            next_bitfield.set(entry_poses[r] + entry_offsets[r]);
+        }
+    }
+    return 0;
+}
 
 struct SORTTHREADDATA
 {
@@ -63,80 +111,6 @@ struct SORTTHREADDATA
     : chunk(chunk_), read_index(read_index_), write_counter(write_counter_), entry(entry_)
     {}
 };
-
-class exit_flag
-{
-    std::atomic<bool> exited_{false};
-    public:
-        void exit() { exited_.store(true, std::memory_order_release); }
-        explicit operator bool() const noexcept { return exited_.load(std::memory_order_acquire); }
-        bool operator !() const noexcept { return !static_cast<bool>(*this); }
-};
-
-void* ScanThread(bitfield* current_bitfield,
-                 bitfield* next_bitfield,
-                 uint8_t const k,
-                 uint8_t const pos_offset_size,
-                 int16_t const entry_size,
-                 concurrent_queue<std::shared_ptr<SCANTHREADDATA> >* q,
-                 exit_flag *exitflag,
-                 std::mutex* nbm)
-{
-    while (true)
-    {
-        if (q->empty()) {
-            if (*exitflag) {
-                break;
-            }else{
-                std::this_thread::sleep_for(std::chrono::milliseconds(20));
-                continue;
-            }
-        }
-        const auto od = q->pop();
-        if(od == boost::none)
-        {
-            continue;
-        }
-        const auto d = od.get();
-        std::shared_ptr<uint8_t> entry_chunk = d->entry;
-        int64_t chunk = d->chunk;
-        int64_t read_index = d->read_index;
-
-        std::vector<uint64_t> entry_poses;
-        std::vector<uint64_t> entry_offsets;
-        entry_poses.reserve(chunk);
-        entry_offsets.reserve(chunk);
-
-        int64_t set_counter_of_this_thread = 0;
-        for(int64_t r = 0; r < chunk; ++r){
-            uint8_t const* entry = reinterpret_cast<uint8_t*>(entry_chunk.get()) + r*entry_size;
-            uint64_t entry_pos_offset = 0;
-            if (!current_bitfield->get(read_index+r))
-            {
-                // This entry should be dropped.
-                continue;
-            }
-            entry_pos_offset = Util::SliceInt64FromBytes(entry, 0, pos_offset_size);
-
-            uint64_t entry_pos = entry_pos_offset >> kOffsetSize;
-            uint64_t entry_offset = entry_pos_offset & ((1U << kOffsetSize) - 1);
-            entry_poses.emplace_back(entry_pos);
-            entry_offsets.emplace_back(entry_offset);
-
-            set_counter_of_this_thread++;
-        }
-
-        {
-            std::lock_guard<std::mutex> lock(*nbm);
-            for(int64_t r = 0; r < set_counter_of_this_thread; ++r){
-            // mark the two matching entries as used (pos and pos+offset)
-                next_bitfield->set(entry_poses[r]);
-                next_bitfield->set(entry_poses[r] + entry_offsets[r]);
-            }
-        }
-    }
-    return 0;
-}
 
 void* SortThread(bitfield* current_bitfield,
                  bitfield_index const* index,
@@ -254,6 +228,8 @@ Phase2Results RunPhase2(
     std::vector<uint64_t> new_table_sizes(8, 0);
     new_table_sizes[7] = table_sizes[7];
 
+    thread_pool pool(num_threads);
+
     // Iterates through each table, starting at 6 & 7. Each iteration, we scan
     // the current table twice. In the first scan, we:
 
@@ -319,14 +295,8 @@ Phase2Results RunPhase2(
             }
         }else{
             std::cout << "parallel scanning" << std::endl;
-            std::vector<std::thread> threads;
-            concurrent_queue<std::shared_ptr<SCANTHREADDATA> > q;
             std::mutex next_bitfield_mutex;
-            exit_flag exitflag;
 
-            for (int i = 0; i < num_threads; ++i) {
-                threads.emplace_back(ScanThread, &current_bitfield, &next_bitfield, k, pos_offset_size, entry_size, &q, &exitflag, &next_bitfield_mutex);
-            }
             std::cout << "thread created" << std::endl;
 
             //TODO: chunk_size should be determined by memory usage
@@ -345,14 +315,19 @@ Phase2Results RunPhase2(
                 std::shared_ptr<uint8_t> sp(sp_ptr, std::default_delete<uint8_t[]>()); // shared_ptr does'nt support array in C++ 17
                 std::copy(entry, entry + chunk*entry_size, sp.get());
 
-                q.push(std::make_shared<SCANTHREADDATA>(chunk,read_index,sp));
+                pool.push_task(ScanThread, std::ref(current_bitfield),
+                                           std::ref(next_bitfield),
+                                           k,
+                                           pos_offset_size,
+                                           entry_size,
+                                           chunk,
+                                           read_index,
+                                           std::move(sp),
+                                           std::ref(next_bitfield_mutex));
             }
             
-            exitflag.exit();
             std::cout << "finished making jobs" << std::endl;
-            for (auto& t : threads) {
-                t.join();
-            }
+            pool.wait_for_tasks();
         }
 
         std::cout << "scanned table " << table_index << std::endl;
