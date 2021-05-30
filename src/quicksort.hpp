@@ -96,12 +96,8 @@ namespace QuickSort {
     {
         uint64_t const memory_len = (uint64_t)entry_len * num_entries;
         static thread_pool pool;
-        const auto start = std::chrono::high_resolution_clock::now();
         pool.push_task(SortInner, memory, memory_len, entry_len, bits_begin, 0, num_entries, std::ref(pool));
         pool.wait_for_tasks();
-        const auto end = std::chrono::high_resolution_clock::now();
-        const auto elapsed = static_cast<double>(std::chrono::duration_cast<std::chrono::milliseconds>(end-start).count());
-        std::cout << "Parallel quick sort took " << elapsed << " mSec" << std::endl;
     }
 
 }

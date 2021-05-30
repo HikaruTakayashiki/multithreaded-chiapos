@@ -20,6 +20,7 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include <chrono>
 
 #include "chia_filesystem.hpp"
 
@@ -302,6 +303,7 @@ private:
             std::cout << "\tBucket " << bucket_i << " uniform sort. Ram: " << std::fixed
                       << std::setprecision(3) << have_ram << "GiB, u_sort min: " << u_ram
                       << "GiB, qs min: " << qs_ram << "GiB." << std::endl;
+            const auto sort_start = std::chrono::high_resolution_clock::now();
             UniformSort::SortToMemory(
                 b.underlying_file,
                 0,
@@ -309,6 +311,9 @@ private:
                 entry_size_,
                 bucket_entries,
                 begin_bits_ + log_num_buckets_);
+            const auto sort_end = std::chrono::high_resolution_clock::now();
+            const auto elapsed = static_cast<double>(std::chrono::duration_cast<std::chrono::milliseconds>(sort_end-sort_start).count());
+            std::cout << "Uniform sort took " << elapsed << " mSec" << std::endl;
         } else {
             // Are we in Compress phrase 1 (quicksort=1) or is it the last bucket (quicksort=2)?
             // Perform quicksort if so (SortInMemory algorithm won't always perform well), or if we
@@ -317,8 +322,17 @@ private:
                       << std::setprecision(3) << have_ram << "GiB, u_sort min: " << u_ram
                       << "GiB, qs min: " << qs_ram << "GiB. force_qs: " << force_quicksort
                       << std::endl;
+            const auto dread_start = std::chrono::high_resolution_clock::now();
             b.underlying_file.Read(0, memory_start_.get(), bucket_entries * entry_size_);
+            const auto dread_end = std::chrono::high_resolution_clock::now();
+            const auto dread_elapsed = static_cast<double>(std::chrono::duration_cast<std::chrono::milliseconds>(dread_end-dread_start).count());
+            std::cout << "Read disk took " << dread_elapsed << " mSec" << std::endl;
+
+            const auto sort_start = std::chrono::high_resolution_clock::now();
             QuickSort::Sort(memory_start_.get(), entry_size_, bucket_entries, begin_bits_ + log_num_buckets_);
+            const auto sort_end = std::chrono::high_resolution_clock::now();
+            const auto elapsed = static_cast<double>(std::chrono::duration_cast<std::chrono::milliseconds>(sort_end-sort_start).count());
+            std::cout << "Parallel quick sort took " << elapsed << " mSec" << std::endl;
         }
 
         // Deletes the bucket file
