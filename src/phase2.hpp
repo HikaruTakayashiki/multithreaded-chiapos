@@ -255,7 +255,7 @@ Phase2Results RunPhase2(
             std::mutex next_bitfield_mutex;
 
             //TODO: chunk_size should be determined by memory usage
-            const int64_t chunk_size = 128*1024*1024/entry_size > entry_size ? 128*1024*1024/entry_size : entry_size;
+            const int64_t chunk_size = 128*1024;
 
             for (int64_t read_index = 0; read_index < table_size; read_index+=chunk_size, read_cursor += entry_size*chunk_size)
             {
@@ -358,7 +358,7 @@ Phase2Results RunPhase2(
             std::mutex sort_manager_mutex;
 
             //TODO: chunk_size should be determined by memory usage
-            const int64_t chunk_size = 128*1024*1024/entry_size > entry_size ? 128*1024*1024/entry_size : entry_size;
+            const int64_t chunk_size = 128*1024;
 
             for (int64_t read_index = 0; read_index < table_size; read_index+=chunk_size, read_cursor += entry_size*chunk_size)
             {
@@ -389,9 +389,7 @@ Phase2Results RunPhase2(
                 );
 
                 // compensates the write_counter as if it will be done.
-                for(int64_t r = 0; r < chunk; ++r){
-                    if (current_bitfield.get(read_index+r)) write_counter++;
-                }
+                write_counter += current_bitfield.count(read_index, read_index+chunk);
             }
 
             std::cout << "finished making jobs" << std::endl;
